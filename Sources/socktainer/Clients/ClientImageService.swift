@@ -372,7 +372,7 @@ struct ClientImageService: ClientImageProtocol {
                 do {
                     try await image.push(
                         platform: effectivePlatform,
-                        scheme: .auto,
+                        scheme: .https,
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
