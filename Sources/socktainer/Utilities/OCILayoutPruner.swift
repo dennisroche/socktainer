@@ -25,7 +25,8 @@ enum OCILayoutPruner {
 
     static func pruneManifestsWithMissingBlobs(at layout: URL, logger: Logger) throws {
         let indexURL = layout.appendingPathComponent("index.json")
-        var index = try JSONDecoder().decode(Index.self, from: Data(contentsOf: indexURL))
+        let (decoded, decodedLeniently) = decodeIndexLeniently(try Data(contentsOf: indexURL), logger: logger)
+        var index = decoded
         let originalDigests = index.manifests.map(\.digest)
 
         let cache = PruneCache()
@@ -34,7 +35,7 @@ enum OCILayoutPruner {
         guard !index.manifests.isEmpty else {
             throw PruneError.nothingLoadable
         }
-        if index.manifests.map(\.digest) != originalDigests {
+        if decodedLeniently || index.manifests.map(\.digest) != originalDigests {
             try JSONEncoder().encode(index).write(to: indexURL)
         }
     }
@@ -73,19 +74,58 @@ enum OCILayoutPruner {
                 return complete ? descriptor : nil
             }
             if isIndex(descriptor.mediaType) {
-                guard var childIndex = try? JSONDecoder().decode(Index.self, from: Data(contentsOf: blobURL(descriptor.digest, in: layout))) else {
+                guard let blobData = try? Data(contentsOf: blobURL(descriptor.digest, in: layout)) else {
                     return nil
                 }
+                let (decoded, decodedLeniently) = decodeIndexLeniently(blobData, logger: logger)
+                var childIndex = decoded
                 let pruned = try childIndex.manifests.compactMap {
                     try prunedDescriptor($0, in: layout, depth: depth + 1, visiting: visiting.union([descriptor.digest]), cache: cache, logger: logger)
                 }
                 guard !pruned.isEmpty else { return nil }
-                guard pruned.map(\.digest) != childIndex.manifests.map(\.digest) else { return descriptor }
+                guard decodedLeniently || pruned.map(\.digest) != childIndex.manifests.map(\.digest) else { return descriptor }
                 childIndex.manifests = pruned
                 return try rewrittenIndex(childIndex, keeping: descriptor, in: layout, logger: logger)
             }
             return descriptor
         }
+    }
+
+    /// Decodes an `Index`, dropping (and logging) only the individual manifest
+    /// entries whose descriptor fails to decode — e.g. a path-traversal digest —
+    /// instead of failing the whole blob. Returns whether the lenient fallback
+    /// path was used, so callers that only rewrite a blob when its manifest list
+    /// changed still rewrite it here (the fallback path already filtered its
+    /// returned manifests, so a naive before/after comparison would see no
+    /// difference and leave the tainted bytes on disk under the same digest).
+    ///
+    /// `Index.manifests` is `[Descriptor]`, and `Descriptor`'s own decoder now
+    /// validates its digest, so `JSONDecoder` aborts the entire array on the
+    /// first invalid element. Decoding each element independently keeps
+    /// otherwise-intact sibling manifests loadable. A blob that isn't valid JSON
+    /// at all yields an index with no manifests, which callers already treat as
+    /// nothing loadable.
+    private static func decodeIndexLeniently(_ data: Data, logger: Logger) -> (Index, decodedLeniently: Bool) {
+        if let index = try? JSONDecoder().decode(Index.self, from: data) {
+            return (index, false)
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (Index(manifests: []), true)
+        }
+        let rawManifests = object["manifests"] as? [[String: Any]] ?? []
+        let manifests: [Descriptor] = rawManifests.compactMap { raw in
+            guard let itemData = try? JSONSerialization.data(withJSONObject: raw),
+                let descriptor = try? JSONDecoder().decode(Descriptor.self, from: itemData)
+            else {
+                logger.warning("dropping manifest entry with an invalid descriptor")
+                return nil
+            }
+            return descriptor
+        }
+        let schemaVersion = object["schemaVersion"] as? Int ?? 2
+        let mediaType = object["mediaType"] as? String ?? MediaTypes.index
+        let annotations = object["annotations"] as? [String: String]
+        return (Index(schemaVersion: schemaVersion, mediaType: mediaType, manifests: manifests, annotations: annotations), true)
     }
 
     private static func rewrittenIndex(_ childIndex: Index, keeping original: Descriptor, in layout: URL, logger: Logger) throws -> Descriptor {
